@@ -62,6 +62,15 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 
+# The three server-type keys Gym nests under a top-level config entry. Gym's
+# constant is private (nemo_gym.discovery._SERVER_GROUP_KEYS), and the literal
+# list also appears in global_config.py, config_types.py, and cli/env.py.
+GYM_SERVER_TYPE_KEYS = (
+    "responses_api_agents",
+    "responses_api_models",
+    "resources_servers",
+)
+
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
@@ -241,6 +250,19 @@ _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
 
+def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
+    """Map the setup-derived generation backend to Gym's capture backend."""
+    generation_backend = token_capture.get("generation_backend")
+    if generation_backend == "vllm":
+        return "vllm_worker"
+    if generation_backend == "megatron":
+        return "megatron_worker"
+    raise ValueError(
+        "token_capture.enabled requires setup-derived generation_backend to be "
+        f"'vllm' or 'megatron'; got {generation_backend!r}"
+    )
+
+
 def _detect_invalid_tool_call_and_malformed_thinking(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
@@ -324,7 +346,11 @@ def get_pad_dynamic_image_shapes(env_config: Mapping[str, Any]) -> bool:
     return bool(nemo_gym_config.get("pad_dynamic_image_shapes"))
 
 
-@ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
+# Fail fast rather than restart. The servers this actor owns are started in
+# _spinup, which Ray does not re-run after a restart, so a restarted actor is
+# permanently broken: _require_spinup() rejects every later rollout call, and
+# the caller never sees the RayActorError it is waiting for.
+@ray.remote(max_restarts=0, max_task_retries=0)  # pragma: no cover
 class NemoGym(EnvironmentInterface):
     """This environment class isn't really used for training. It's really meant as an integration wrapper around NeMo-Gym that hooks into the existing NeMo RL resource management via ray. So there is still one source of truth for resource management in NeMo RL."""
 
@@ -375,16 +401,19 @@ class NemoGym(EnvironmentInterface):
                 "serve rollouts until it is spun up again."
             )
 
-    def health_check(self) -> None:
+    async def health_check(self) -> None:
         """Raise if the Gym head server or any subprocess server has died.
 
         Thin wrapper over NeMo-Gym's own ``RunHelper.poll``, which is what ``gym env
         start`` calls every 60s from ``run_forever``. NeMo-RL only calls ``rh.start``,
         so without this the check Gym already implements never runs and a dead tool
         server surfaces as unexplained rollout timeouts instead of a named process.
+
+        Run the synchronous poll in a worker thread so this probe does not block
+        concurrent rollouts on the actor's event loop.
         """
         self._require_spinup()
-        self.rh.poll()
+        await asyncio.to_thread(self.rh.poll)
 
     def _spinup(self) -> None:
         """Start the NeMo-Gym head server and rollout collection helper.
@@ -415,6 +444,9 @@ class NemoGym(EnvironmentInterface):
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
+        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
+            "rollout_max_attempts_to_avoid_lp_nan", 1
+        )
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -476,6 +508,13 @@ Depending on your data shape, you may want to change these values."""
         self._control_headers: Dict[str, str] = {}
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
+            assert token_capture is not None
+            if self.rollout_max_attempts_to_avoid_lp_nan != 1:
+                raise ValueError(
+                    "token_capture.enabled requires "
+                    "rollout_max_attempts_to_avoid_lp_nan == 1: a NaN retry "
+                    "would resolve against the first attempt's ledger rows"
+                )
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -495,6 +534,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
+                "external_staging_backend": _external_staging_backend(token_capture),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
@@ -585,6 +625,51 @@ Depending on your data shape, you may want to change these values."""
                 f"HTTP {response.status} {await response.text()}"
             )
         return await response.json()
+
+    def list_entries(self) -> Dict[str, List[str]]:
+        """Report which config entries this actor actually spawned.
+
+        Returns ``{entry_name: [server_type_keys]}`` read from Gym's *resolved*
+        config, so entries that arrived via ``config_paths`` are included. The
+        config NeMo RL passed in is not a substitute: it still holds
+        ``config_paths`` as file paths and none of the entries they expand
+        into, so reading it would miss every agent and judge loaded from a
+        path.
+
+        Entries whose server config has no ``entrypoint`` are omitted because
+        Gym does not start a process for them.
+
+        Callers compare these names across actors to build the agent->shard map
+        and to catch an entry duplicated across shards. Names are all that is
+        interpreted; what an entry *means* is Gym's business.
+        """
+        if self.rh is None:
+            raise RuntimeError(
+                "list_entries() needs a running Gym stack; call _spinup() first."
+            )
+
+        from nemo_gym.global_config import get_global_config_dict
+        from omegaconf import DictConfig
+
+        resolved = get_global_config_dict()
+        entries: Dict[str, List[str]] = {}
+        for name, entry in resolved.items():
+            if not isinstance(entry, (dict, DictConfig)):
+                continue
+            # Fixed key order so the map is stable across actors and runs.
+            types = []
+            for key in GYM_SERVER_TYPE_KEYS:
+                server_group = entry.get(key)
+                if not isinstance(server_group, (dict, DictConfig)):
+                    continue
+                if any(
+                    isinstance(server, (dict, DictConfig)) and "entrypoint" in server
+                    for server in server_group.values()
+                ):
+                    types.append(key)
+            if types:
+                entries[str(name)] = types
+        return entries
 
     async def run_rollouts(
         self,
@@ -852,7 +937,7 @@ Depending on your data shape, you may want to change these values."""
             )
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
-        return {
+        receipt = {
             "rollout_id": rollout_id,
             "reward": reward,
             "terminal_model_call_id": (
@@ -866,6 +951,7 @@ Depending on your data shape, you may want to change these values."""
             "terminal_selection": terminal_selection,
             "terminal_attribution_reason": attribution_reason,
         }
+        return receipt
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
@@ -1145,13 +1231,16 @@ output prompt token ids till seen: {output_item_dict["prompt_token_ids"][: len(s
         return result
 
     def shutdown(self) -> None:
-        # Teardown runs in a finally block, so it must not turn a real training error
-        # into a confusing AttributeError from a never-spun-up (e.g. restarted) actor.
-        if self.rh is None:
-            return
-        run_helper = self.rh
-        self.rh = None
-        run_helper.shutdown()
+        """Stop the Gym servers. Safe to call more than once, and before spinup.
+
+        Teardown runs in a finally block and may be requested more than once.
+        RunHelper.shutdown() is not idempotent, so the handle is cleared before
+        it is used. A failure therefore cannot leave a live handle that a later
+        cleanup attempt invokes again.
+        """
+        rh, self.rh = self.rh, None
+        if rh is not None:
+            rh.shutdown()
 
     def step(self, message_log_batch, metadata):
         # This is not used since NeMo-Gym will handle the rollouts entirely.
@@ -1240,16 +1329,19 @@ def validate_reward_components_match_scalar(nemo_gym_results: List[dict]) -> Non
 def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
-    backend = generation_config.get("backend")
-    if backend == "vllm":
-        # Enable the http server. Requires both async engine and the expose_http_server flag
+    # Enable the backend's OpenAI-compatible server.
+    if generation_config["backend"] == "vllm":
         generation_config["vllm_cfg"]["async_engine"] = True
         generation_config["vllm_cfg"]["expose_http_server"] = True
-    elif backend == "megatron":
-        # Enable the http server for Gym dispatch over the Megatron generation backend.
+    elif generation_config["backend"] == "megatron":
+        # Megatron Inference is always async; should_use_async_rollouts rejects
+        # an explicit mcore_generation_config.async_engine key.
         generation_config["mcore_generation_config"]["expose_http_server"] = True
     else:
-        raise ValueError(f"NeMo Gym does not support generation backend {backend!r}.")
+        raise ValueError(
+            "NeMo-Gym setup supports vllm or megatron generation; got "
+            f"{generation_config['backend']!r}"
+        )
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None

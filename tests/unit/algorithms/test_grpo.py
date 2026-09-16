@@ -61,7 +61,6 @@ from nemo_rl.algorithms.grpo import (
     grpo_train,
     refit_policy_generation,
     setup,
-    shutdown_environments,
     validate,
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
@@ -2022,35 +2021,6 @@ def test_async_grpo_awaits_resume_after_refit_failure(mock_grpo_components) -> N
         )
 
 
-def test_shutdown_environments_drains_unique_actors_before_kill() -> None:
-    shared_environment = MagicMock()
-    failing_environment = MagicMock()
-    shared_shutdown_ref = object()
-    failing_shutdown_ref = object()
-    shared_environment.shutdown.remote.return_value = shared_shutdown_ref
-    failing_environment.shutdown.remote.return_value = failing_shutdown_ref
-
-    def get_or_fail(ref, timeout=None):
-        assert timeout == 10
-        if ref is failing_shutdown_ref:
-            raise RuntimeError("environment shutdown failed")
-        assert ref is shared_shutdown_ref
-        return True
-
-    with (
-        patch("nemo_rl.algorithms.grpo.ray.get", side_effect=get_or_fail),
-        patch("nemo_rl.algorithms.grpo.ray.kill") as ray_kill,
-    ):
-        shutdown_environments(
-            {"train": shared_environment, "failing": failing_environment},
-            {"validation": shared_environment},
-        )
-
-    shared_environment.shutdown.remote.assert_called_once_with()
-    failing_environment.shutdown.remote.assert_called_once_with()
-    ray_kill.assert_called_once_with(failing_environment)
-
-
 def test_should_use_nemo_gym_requires_dynamo_token_wrapper() -> None:
     master_config = MagicMock()
     master_config.env = {"should_use_nemo_gym": True}
@@ -2784,6 +2754,92 @@ def test_dapo_dynamic_sampling_filters_on_raw_metric_after_overlong_shaping(
         result_batch["message_log"][i][0]["content"] for i in range(result_batch.size)
     ]
     assert surviving_prompts == ["prompt_1", "prompt_1", "prompt_1"]
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "precision", "error"),
+    [
+        ("fp8", "fp8", "DTensor backend is not supported"),
+        ("fp8_e4m3", "fp8", "DTensor backend is not supported"),
+        ("fp8_ds_mla", "fp8", None),
+        ("fp8_ds_mla", "bfloat16", "requires precision='fp8'"),
+        ("auto", "bfloat16", None),
+    ],
+)
+def test_setup_dtensor_fp8_kv_cache_guard(
+    mock_grpo_components, monkeypatch, kv_cache_dtype, precision, error
+):
+    import nemo_rl.algorithms.grpo as grpo_mod
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.val_period = 0
+    master_config.grpo.batch_multiplier = 1
+    master_config.data.update(shuffle=False, num_workers=0)
+    master_config.policy.update(
+        model_name="deepseek-v4-test",
+        dtensor_cfg={"enabled": True},
+        megatron_cfg={"enabled": False},
+    )
+    master_config.policy["generation"]["vllm_cfg"].update(
+        async_engine=False, precision=precision, kv_cache_dtype=kv_cache_dtype
+    )
+    checkpointer = MagicMock()
+    checkpointer.get_latest_checkpoint_path.return_value = None
+    checkpointer.load_training_info.return_value = None
+    checkpointer.get_resume_paths.return_value = (None, None)
+    monkeypatch.setattr(grpo_mod, "Logger", MagicMock())
+    monkeypatch.setattr(grpo_mod, "CheckpointManager", lambda _config: checkpointer)
+    monkeypatch.setattr(grpo_mod, "StatefulDataLoader", MagicMock())
+    monkeypatch.setattr(grpo_mod, "RayVirtualCluster", MagicMock())
+    monkeypatch.setattr(
+        grpo_mod, "prepare_segment_topology", lambda *_args: (None, [], {})
+    )
+
+    class GenerationInitReached(Exception):
+        pass
+
+    generation_init = MagicMock(side_effect=GenerationInitReached)
+    monkeypatch.setattr(grpo_mod, "VllmGeneration", generation_init)
+    policy_init = MagicMock(
+        side_effect=AssertionError("Policy initialization is unexpected")
+    )
+    monkeypatch.setattr(grpo_mod, "Policy", policy_init)
+
+    with (
+        pytest.raises(AssertionError, match=error)
+        if error
+        else pytest.raises(GenerationInitReached)
+    ):
+        grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+    assert generation_init.call_count == int(error is None)
+    policy_init.assert_not_called()
+
+
+def test_setup_rejects_megatron_router_replay_before_side_effects(
+    mock_grpo_components,
+):
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["router_replay"] = {"enabled": True}
+    master_config.policy["generation"]["backend"] = "megatron"
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError,
+            match="only supported on the SingleController token-capture path",
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+
+    mock_logger.assert_not_called()
 
 
 def test_noncolocated_inference_requires_explicit_gpus_per_node_single_node(
@@ -6161,3 +6217,58 @@ def test_train_fields_for_step(skip_prev_logprobs, expect_prev):
 )
 def test_needs_hf_refit_handshake(backend, nccl_reshard, colocated, expected):
     assert _needs_hf_refit_handshake(backend, nccl_reshard, colocated) is expected
+
+
+def test_grpo_train_shuts_down_environments_after_failure():
+    task_to_env = {"nemo_gym": MagicMock()}
+    val_task_to_env = task_to_env
+
+    with (
+        patch(
+            "nemo_rl.algorithms.grpo._grpo_train_impl",
+            side_effect=RuntimeError("rollout failed"),
+        ),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+        pytest.raises(RuntimeError, match="rollout failed"),
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, val_task_to_env)
+
+
+def test_grpo_train_shuts_down_environments_after_success():
+    task_to_env = {"nemo_gym": MagicMock()}
+
+    with (
+        patch("nemo_rl.algorithms.grpo._grpo_train_impl"),
+        patch("nemo_rl.algorithms.grpo.shutdown_environments") as shutdown,
+    ):
+        grpo_train(
+            policy=MagicMock(),
+            policy_generation=MagicMock(),
+            wrapped_dataloader=MagicMock(),
+            val_dataloader=None,
+            tokenizer=MagicMock(),
+            loss_fn=MagicMock(),
+            task_to_env=task_to_env,
+            val_task_to_env=task_to_env,
+            logger=MagicMock(),
+            checkpointer=MagicMock(),
+            grpo_save_state=MagicMock(),
+            master_config=MagicMock(),
+        )
+
+    shutdown.assert_called_once_with(task_to_env, task_to_env)

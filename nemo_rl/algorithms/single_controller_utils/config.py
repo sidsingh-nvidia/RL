@@ -615,6 +615,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
+    # Generation backend hosting token capture. This is derived from
+    # policy.generation.backend during setup; users should not set it separately.
+    generation_backend: Optional[Literal["vllm", "megatron"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
     defer_routed_experts_to_policy: bool = False
@@ -741,9 +744,20 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     ``val:<name>`` settings are rejected during setup. Unknown keys are
     forbidden because a misspelled interval, retention, or restore option can
     silently disable the durability behavior the operator intended.
+
+    ``telemetry_interval_s=None`` disables the independent wall-clock sampler
+    for rollout/checkpoint benchmark metrics. It does not enable checkpointing
+    and may be configured without ``snapshot_attempt_interval_s``.
+
+    ``max_consecutive_failures`` controls how many consecutive retryable
+    periodic-checkpoint failures are tolerated before the controller aborts the
+    run. A successful or skipped attempt resets the counter; checkpoint
+    invariant failures still fail immediately.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    telemetry_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    max_consecutive_failures: Annotated[int, Field(ge=1)] = 3
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)

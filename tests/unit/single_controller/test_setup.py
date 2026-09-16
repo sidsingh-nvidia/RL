@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 import threading
+import types
 from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
@@ -224,6 +226,54 @@ def _save_state(
     state.current_epoch = epoch
     state.trainer_version = trainer_version
     return state
+
+
+def _stub_megatron_inference_request(
+    monkeypatch: pytest.MonkeyPatch, inference_request: types.SimpleNamespace
+) -> None:
+    """Make ``from megatron.core.inference import inference_request`` resolve to a stub.
+
+    Stubs the parent packages too, so the check does not depend on whether the
+    driver venv carries megatron-core (unit tests run without it).
+    """
+    for name in ("megatron", "megatron.core", "megatron.core.inference"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.inference.inference_request", inference_request
+    )
+
+
+def test_require_minf_capture_hooks_rejects_megatron_core_without_pr_7015(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch, types.SimpleNamespace(RequestPayloadStager=object)
+    )
+
+    with pytest.raises(NotImplementedError, match="lacks RequestPromptPreparer"):
+        sc_setup_mod._require_minf_capture_hooks()
+
+
+def test_require_minf_capture_hooks_accepts_megatron_core_with_pr_7015(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            RequestPayloadStager=object, RequestPromptPreparer=object
+        ),
+    )
+
+    assert sc_setup_mod._require_minf_capture_hooks() is None
+
+
+def test_require_minf_capture_hooks_defers_to_worker_without_megatron_core(
+    monkeypatch,
+) -> None:
+    # None in sys.modules makes the import raise ModuleNotFoundError.
+    monkeypatch.setitem(sys.modules, "megatron", None)
+
+    assert sc_setup_mod._require_minf_capture_hooks() is None
 
 
 @pytest.fixture
@@ -694,6 +744,38 @@ class TestSetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["_build_trainer"].assert_not_called()
 
+    def test_warns_when_rollout_telemetry_lacks_vllm_metrics(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {"async_engine": True}
+
+        with pytest.warns(UserWarning, match="vLLM token, request, and KV-cache"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_warns_when_vllm_telemetry_uses_sync_engine(self, patched_factories):
+        mc = _make_master_config()
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": False,
+            "enable_vllm_metrics_logger": True,
+        }
+
+        with pytest.warns(UserWarning, match="async_engine=true"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_non_vllm_telemetry_warning_has_no_vllm_config_guidance(
+        self, patched_factories
+    ):
+        mc = _make_master_config(backend="sglang")
+        mc.rollout_checkpointing.telemetry_interval_s = 30.0
+
+        with pytest.warns(UserWarning) as warning_records:
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        messages = [str(record.message) for record in warning_records]
+        assert any("backend='sglang'" in message for message in messages)
+        assert all("enable_vllm_metrics_logger" not in message for message in messages)
+
     def test_rejects_mooncake_data_plane_checkpointing(self):
         mc = _make_master_config()
         mc.data_plane["backend"] = "mooncake_cpu"
@@ -1121,6 +1203,16 @@ class TestSetup:
                 "min_groups_for_streaming_train",
             ),
             ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
+            (
+                "megatron_routes_without_capture",
+                ValueError,
+                "router replay requires token_capture.enabled",
+            ),
+            (
+                "megatron_deferred_routes",
+                NotImplementedError,
+                "defer_routed_experts_to_policy",
+            ),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
             (
                 "deferred_routes_without_capture",
@@ -1151,7 +1243,7 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        use_gym = invalid_case == "gym_on_sglang"
+        use_gym = invalid_case in ("megatron_deferred_routes", "gym_on_sglang")
         if invalid_case == "min_groups":
             mc = _make_master_config()
             mc.async_rl.min_groups_for_streaming_train = 5
@@ -1191,6 +1283,16 @@ class TestSetup:
         elif invalid_case == "colocated_vllm":
             # Colocated generation is rejected for every backend but megatron.
             mc = _make_master_config(colocated=True)
+        elif invalid_case == "megatron_routes_without_capture":
+            mc = _make_master_config(
+                colocated=False, backend="megatron", megatron_enabled=True
+            )
+            mc.policy["router_replay"] = {"enabled": True}
+        elif invalid_case == "megatron_deferred_routes":
+            mc = self._make_gym_megatron_config()
+            mc.token_capture.enabled = True
+            mc.token_capture.defer_routed_experts_to_policy = True
+            mc.policy["router_replay"] = {"enabled": True}
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
@@ -1611,7 +1713,7 @@ class TestSetup:
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
-            ),
+            ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
@@ -1633,6 +1735,10 @@ class TestSetup:
         partition_calls = actor_args.dp_client.register_partition.call_args_list
         assert WIRE_MULTIMODAL_FIELDS <= set(partition_calls[0].kwargs["fields"])
         assert WIRE_MULTIMODAL_FIELDS.isdisjoint(partition_calls[1].kwargs["fields"])
+        assert mc.token_capture.generation_backend == "vllm"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "vllm"
+        )
 
     def test_setup_timing_populated_for_noncolocated_vllm(self, patched_factories):
         """Non-colocated vLLM records every per-phase field."""
@@ -1837,6 +1943,9 @@ class TestSetup:
         gym = scenario != "native"
         if gym:
             mc = self._make_gym_megatron_config(colocated=colocated)
+            if scenario == "gym":
+                # Direct MInf route staging is the supported Megatron R3 mode.
+                mc.policy["router_replay"] = {"enabled": True}
             patched_factories["setup_response_data"].return_value = (
                 list(range(8)),
                 None,

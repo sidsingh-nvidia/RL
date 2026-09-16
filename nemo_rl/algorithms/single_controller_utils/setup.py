@@ -103,6 +103,7 @@ from nemo_rl.experience.rollout_manager import (
     RolloutRetryPolicy,
     RolloutTimeouts,
 )
+from nemo_rl.experience.rollout_recovery import ROLLOUT_RECOVERY_STATE_FILENAME
 from nemo_rl.experience.rollouts import (
     get_nemo_gym_thinking_tags,
     resolve_reward_penalty_config,
@@ -165,6 +166,7 @@ class SingleControllerActorArgs:
     # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
     bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
     # None when async_rl.generation_fleet_health is disabled; the SingleController
     # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
@@ -935,6 +937,40 @@ def _load_opd_full_teacher_lm_heads(
     )
 
 
+_MINF_CAPTURE_HOOK_PROTOCOLS = ("RequestPayloadStager", "RequestPromptPreparer")
+
+
+def _require_minf_capture_hooks() -> None:
+    """Fail at setup if the pinned megatron-core lacks the MInf capture hooks.
+
+    Megatron token capture installs a ``RequestPayloadStager`` and a
+    ``RequestPromptPreparer`` on ``DynamicInferenceEngine`` (NVIDIA/Megatron-LM
+    PR #7015). Both protocols live in ``megatron.core.inference.inference_request``,
+    so their presence can be checked at config time without building an engine.
+    """
+    try:
+        # Deferred import: megatron-core is a heavy, optional dependency that the
+        # driver venv may not carry at all.
+        from megatron.core.inference import inference_request
+    except ImportError:
+        # The worker-side guard in MegatronGenerationMixin.setup_token_capture
+        # still fails loudly when the engine lacks the hooks.
+        return
+    missing = [
+        name
+        for name in _MINF_CAPTURE_HOOK_PROTOCOLS
+        if not hasattr(inference_request, name)
+    ]
+    if missing:
+        raise NotImplementedError(
+            "Megatron token capture requires the MInf capture hooks from "
+            "NVIDIA/Megatron-LM PR #7015; the pinned megatron-core lacks "
+            f"{', '.join(missing)}. Bump 3rdparty/Megatron-Bridge-workspace/"
+            "Megatron-Bridge to a revision that includes it, or use "
+            "policy.generation.backend=vllm."
+        )
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -1040,6 +1076,38 @@ def setup_single_controller(
         "single_controller_utils.setup requires policy.generation in master_config"
     )
 
+    telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
+    if telemetry_interval_s is not None:
+        generation_backend = generation_config["backend"]
+        if generation_backend != "vllm":
+            warnings.warn(
+                "rollout_checkpointing.telemetry_interval_s is enabled with "
+                f"policy.generation.backend={generation_backend!r}. Canonical "
+                "rollout telemetry will be recorded, but vLLM token, request, "
+                "and KV-cache signals are unavailable for this backend.",
+                stacklevel=2,
+            )
+        else:
+            vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
+            if not vllm_cfg.get("enable_vllm_metrics_logger"):
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s is enabled, but "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger is "
+                    "false. Canonical rollout telemetry will be recorded, but "
+                    "vLLM token, request, and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
+            elif not vllm_cfg["async_engine"]:
+                warnings.warn(
+                    "rollout_checkpointing.telemetry_interval_s and "
+                    "policy.generation.vllm_cfg.enable_vllm_metrics_logger are "
+                    "enabled, but vLLM metric collection requires "
+                    "policy.generation.vllm_cfg.async_engine=true. Canonical "
+                    "rollout telemetry will be recorded, but vLLM token, request, "
+                    "and KV-cache signals will be absent.",
+                    stacklevel=2,
+                )
+
     if data_config["use_multiple_dataloader"]:
         raise NotImplementedError(
             "single_controller_utils does not support "
@@ -1056,11 +1124,21 @@ def setup_single_controller(
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # Token capture: validate the supported combination loudly at setup
-    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
-    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
-    # ray_actor_environment_registry.py), so nothing here needs to change the
-    # worker's environment.
+    # (NeMo-Gym rollout path; vLLM with async_engine=true, or Megatron with
+    # expose_http_server=true). The serving worker's venv already carries
+    # nemo_gym for both backends (see ACTOR_ENVIRONMENTS in
+    # nemo_rl/distributed/actor_environments.py), so nothing here needs to
+    # change the worker's environment.
     token_capture_cfg = master_config.token_capture
+    if (
+        generation_config["backend"] == "megatron"
+        and router_replay_enabled(master_config.policy)
+        and not token_capture_cfg.enabled
+    ):
+        raise ValueError(
+            "Megatron router replay requires token_capture.enabled=true so "
+            "MInf routing indices can be joined with Gym lineage"
+        )
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1101,22 +1179,41 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] != "vllm":
+        if generation_config["backend"] not in ("vllm", "megatron"):
             raise NotImplementedError(
-                "token_capture.enabled supports the vllm backend only; got "
+                "token_capture.enabled supports vllm or megatron; got "
                 f"{generation_config['backend']!r}"
             )
-        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
-        if not vllm_cfg["async_engine"]:
+        if (
+            generation_config["backend"] == "vllm"
+            and not generation_config["vllm_cfg"]["async_engine"]
+        ):
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
+        if generation_config["backend"] == "megatron":
+            if not generation_config["mcore_generation_config"]["expose_http_server"]:
+                raise ValueError(
+                    "Megatron token capture requires policy.generation."
+                    "mcore_generation_config.expose_http_server=true"
+                )
+            if (
+                router_replay_enabled(master_config.policy)
+                and token_capture_cfg.defer_routed_experts_to_policy
+            ):
+                raise NotImplementedError(
+                    "Megatron token capture does not support "
+                    "token_capture.defer_routed_experts_to_policy yet; MInf "
+                    "routing indices are aligned in the canonical stager"
+                )
+            _require_minf_capture_hooks()
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token and the process-shared capture
-        # directory used by every Gym worker.
+        # per-run control-plane bearer token, the process-shared capture
+        # directory used by every Gym worker, and the capture-host backend.
+        token_capture_cfg.generation_backend = generation_config["backend"]
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1195,6 +1292,7 @@ def setup_single_controller(
         if save_state.trainer_version is not None
         else save_state.current_step
     )
+    snapshot_resolution_started = time.monotonic()
     if (
         trainer_checkpoint_path is not None
         and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
@@ -1234,6 +1332,7 @@ def setup_single_controller(
                 expected_trainer_version=0,
                 expected_bootstrap_fingerprint=bootstrap_digest,
             )
+    snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
@@ -1250,6 +1349,18 @@ def setup_single_controller(
             f"without considering newer periodic snapshots: {trainer_checkpoint_path}",
             flush=True,
         )
+    recovery_path = (
+        Path(recovery_checkpoint_path) if recovery_checkpoint_path is not None else None
+    )
+    has_rollout_checkpoint_payload = recovery_path is not None and (
+        (recovery_path / REPLAY_BUFFER_METADATA_FILENAME).is_file()
+        or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
+    )
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = (
+        {"snapshot_resolution_seconds": snapshot_resolution_seconds}
+        if has_rollout_checkpoint_payload
+        else None
+    )
 
     # ==========================
     # Setup Dataset & Environments
@@ -1295,7 +1406,12 @@ def setup_single_controller(
         print(
             f"📦 Restoring dataloader state from checkpoint: {recovery_checkpoint_path}"
         )
+        dataloader_load_started = time.monotonic()
         load_dataloader_state(dataloader, recovery_checkpoint_path, data_config)
+        if rollout_checkpoint_load_metrics is not None:
+            rollout_checkpoint_load_metrics["dataloader_load_seconds"] = (
+                time.monotonic() - dataloader_load_started
+            )
 
     _clamp_max_num_steps(master_config, dataloader)
     _maybe_inject_megatron_train_iters(master_config)
@@ -1606,6 +1722,7 @@ def setup_single_controller(
     # Native TQ restore must run through the trainer's bootstrap client before
     # the normal SC data-plane client is created or any rollout/train data-plane
     # operation starts.
+    data_plane_load_started = time.monotonic()
     data_plane_checkpoint_metadata = _maybe_restore_native_data_plane_checkpoint(
         trainer,
         last_checkpoint_path=recovery_checkpoint_path,
@@ -1613,6 +1730,10 @@ def setup_single_controller(
         partition_id=partition_id,
         sampler_name=master_config.async_rl.sampler.name,
     )
+    if rollout_checkpoint_load_metrics is not None:
+        rollout_checkpoint_load_metrics["tq_load_seconds"] = (
+            time.monotonic() - data_plane_load_started
+        )
 
     if use_nemo_gym:
         # the two fields are only meaningful when use_nemo_gym enabled
@@ -1738,9 +1859,7 @@ def setup_single_controller(
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
-        # Host Gym's capture core in every vLLM DP leader (in-worker DP
-        # client + TQTokenSink + the single install_capture call), and give
-        # workers the initial weight version to stamp on captured calls.
+        # Both active backends stage canonical Gym rows in serving workers.
         generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
         generation.set_rollout_weight_version(0)
 
@@ -1858,6 +1977,7 @@ def setup_single_controller(
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
         bootstrap_identity=bootstrap_identity,
+        rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,
