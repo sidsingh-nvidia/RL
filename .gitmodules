@@ -1,7 +1,7 @@
 [submodule "3rdparty/Megatron-Bridge"]
 	path = 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge
-	url = git@github.com:ArEsKay3/Megatron-Bridge.git
-	branch = main
+	url = git@github.com:sidsingh-nvidia/Megatron-Bridge.git
+	branch = sidsingh/canonical-router-replay
 	shallow = true
 [submodule "3rdparty/Automodel-workspace/Automodel"]
 	path = 3rdparty/Automodel-workspace/Automodel
@@ -10,6 +10,6 @@
 	shallow = true
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
-	url = https://github.com/NVIDIA-NeMo/Gym.git
-	branch = main
+	url = git@github.com:sidsingh-nvidia/Gym.git
+	branch = sidsingh/megatron-adapter-merged
 	shallow = true
