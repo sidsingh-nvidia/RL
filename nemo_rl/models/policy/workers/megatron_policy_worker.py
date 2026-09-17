@@ -82,6 +82,7 @@ from nemo_rl.models.megatron.pipeline_parallel import (
 from nemo_rl.models.megatron.router_replay import (
     router_replay_dimensions,
     router_replay_enabled,
+    sync_inference_router_replay_mtp_exclusion,
 )
 from nemo_rl.models.megatron.setup import (
     build_inference_model,
@@ -464,8 +465,8 @@ class MegatronPolicyWorkerImpl(
         }
 
     def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return route dimensions from the initialized Megatron model config."""
-        return router_replay_dimensions(self._get_model_config())
+        """Return route dimensions from the initialized Megatron model."""
+        return router_replay_dimensions(self.model)
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
@@ -597,6 +598,12 @@ class MegatronPolicyWorkerImpl(
 
         self.cfg = config
         self._router_replay_enabled = router_replay_enabled(config)
+        if self._router_replay_enabled:
+            # Keep mcore's inference-time capture (RouterReplay.exclude_mtp_layers)
+            # in sync with the same NRL_ROUTER_REPLAY_EXCLUDE_MTP env var the
+            # training-side replay path already reads, so MTP-layer routers
+            # either participate on both sides or neither.
+            sync_inference_router_replay_mtp_exclusion()
         self._nixl_preinit_agent = maybe_preinit_nixl_checkpoint_engine(config)
 
         # Set rank for non-collocated to check which ranks to broadcast from
