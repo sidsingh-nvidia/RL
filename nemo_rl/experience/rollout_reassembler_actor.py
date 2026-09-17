@@ -23,6 +23,7 @@ import torch
 
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutReassembler
+from nemo_rl.utils.venvs import make_actor_runtime_env
 
 # Field names whose values are per-token and therefore large, but whose Python
 # type is indistinguishable from metadata -- a list[int] of token ids looks just
@@ -172,6 +173,12 @@ def create_rollout_reassembler_actors(
     """Construct the fixed validation pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    )
     return [
-        RolloutReassemblerActor.remote(dp_config, config) for _ in range(num_workers)
+        RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
+            dp_config, config
+        )
+        for _ in range(num_workers)
     ]
